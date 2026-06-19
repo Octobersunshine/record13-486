@@ -73,13 +73,16 @@ func (m *MemoryDB) initSampleData() {
 }
 
 type MemorySession struct {
-	ID             string
-	CreatedAt      time.Time
-	LastAccessedAt time.Time
-	ExpiresAt      time.Time
-	IdleExpiresAt  time.Time
-	QueryCount     int64
-	db             *MemoryDB
+	ID                string
+	CreatedAt         time.Time
+	LastAccessedAt    time.Time
+	ExpiresAt         time.Time
+	IdleExpiresAt     time.Time
+	QueryCount        int64
+	IdleTimeout       time.Duration
+	MaxLifetime       time.Duration
+	IsCustomTimeout   bool
+	db                *MemoryDB
 }
 
 type SessionStats struct {
@@ -118,10 +121,23 @@ type MemorySessionManager struct {
 	startTime     time.Time
 }
 
+type SessionConfig struct {
+	IdleTimeout time.Duration `json:"idle_timeout"`
+	MaxLifetime time.Duration `json:"max_lifetime"`
+	MaxSessions int           `json:"max_sessions"`
+}
+
 const (
-	DefaultIdleTimeout = 5 * time.Minute
-	DefaultMaxLifetime = 30 * time.Minute
-	DefaultMaxSessions = 100
+	DefaultIdleTimeout     = 5 * time.Minute
+	DefaultMaxLifetime     = 30 * time.Minute
+	DefaultMaxSessions     = 100
+	MinIdleTimeout         = 1 * time.Second
+	MaxIdleTimeout         = 2 * time.Hour
+	MinMaxLifetime         = 10 * time.Second
+	MaxMaxLifetime         = 24 * time.Hour
+	MinMaxSessions         = 1
+	MaxMaxSessions         = 10000
+	MaxIdleLifetimeRatio   = 100
 )
 
 func NewMemorySessionManager(idleTimeout time.Duration) *MemorySessionManager {
@@ -155,16 +171,79 @@ func NewMemorySessionManager(idleTimeout time.Duration) *MemorySessionManager {
 	}
 }
 
-func (sm *MemorySessionManager) SetMaxSessions(max int) {
+func ValidateSessionConfig(idleTimeout, maxLifetime time.Duration, maxSessions int) error {
+	if idleTimeout < MinIdleTimeout {
+		return fmt.Errorf("idle_timeout too short: %v (minimum: %v)", idleTimeout, MinIdleTimeout)
+	}
+	if idleTimeout > MaxIdleTimeout {
+		return fmt.Errorf("idle_timeout too long: %v (maximum: %v)", idleTimeout, MaxIdleTimeout)
+	}
+	if maxLifetime < MinMaxLifetime {
+		return fmt.Errorf("max_lifetime too short: %v (minimum: %v)", maxLifetime, MinMaxLifetime)
+	}
+	if maxLifetime > MaxMaxLifetime {
+		return fmt.Errorf("max_lifetime too long: %v (maximum: %v)", maxLifetime, MaxMaxLifetime)
+	}
+	if maxLifetime < idleTimeout {
+		return fmt.Errorf("max_lifetime (%v) must be >= idle_timeout (%v)", maxLifetime, idleTimeout)
+	}
+	if maxLifetime > idleTimeout*time.Duration(MaxIdleLifetimeRatio) {
+		return fmt.Errorf("max_lifetime (%v) too large compared to idle_timeout (%v, max ratio: %d)",
+			maxLifetime, idleTimeout, MaxIdleLifetimeRatio)
+	}
+	if maxSessions < MinMaxSessions {
+		return fmt.Errorf("max_sessions too small: %d (minimum: %d)", maxSessions, MinMaxSessions)
+	}
+	if maxSessions > MaxMaxSessions {
+		return fmt.Errorf("max_sessions too large: %d (maximum: %d)", maxSessions, MaxMaxSessions)
+	}
+	return nil
+}
+
+func (sm *MemorySessionManager) SetMaxSessions(max int) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if max > 0 {
-		sm.maxSessions = max
-		sm.stats.MaxSessions = max
+	if err := ValidateSessionConfig(sm.idleTimeout, sm.maxLifetime, max); err != nil {
+		return err
+	}
+	sm.maxSessions = max
+	sm.stats.MaxSessions = max
+	return nil
+}
+
+func (sm *MemorySessionManager) SetDefaultTimeout(idleTimeout, maxLifetime time.Duration) error {
+	if err := ValidateSessionConfig(idleTimeout, maxLifetime, sm.maxSessions); err != nil {
+		return err
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.idleTimeout = idleTimeout
+	sm.maxLifetime = maxLifetime
+	sm.stats.IdleTimeout = idleTimeout.String()
+	sm.stats.MaxLifetime = maxLifetime.String()
+	log.Printf("[SessionManager] Default timeouts updated: idle=%v, max_lifetime=%v", idleTimeout, maxLifetime)
+	return nil
+}
+
+func (sm *MemorySessionManager) GetConfig() SessionConfig {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return SessionConfig{
+		IdleTimeout: sm.idleTimeout,
+		MaxLifetime: sm.maxLifetime,
+		MaxSessions: sm.maxSessions,
 	}
 }
 
 func (sm *MemorySessionManager) CreateSession() (*MemorySession, error) {
+	return sm.createSessionInternal(0, 0)
+}
+
+func (sm *MemorySessionManager) CreateSessionWithTimeout(idleTimeout, maxLifetime time.Duration) (*MemorySession, error) {
+	return sm.createSessionInternal(idleTimeout, maxLifetime)
+}
+
+func (sm *MemorySessionManager) createSessionInternal(customIdleTimeout, customMaxLifetime time.Duration) (*MemorySession, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -174,16 +253,41 @@ func (sm *MemorySessionManager) CreateSession() (*MemorySession, error) {
 		}
 	}
 
+	idleTimeout := sm.idleTimeout
+	maxLifetime := sm.maxLifetime
+	isCustom := false
+
+	if customIdleTimeout > 0 || customMaxLifetime > 0 {
+		if customIdleTimeout <= 0 {
+			customIdleTimeout = sm.idleTimeout
+		}
+		if customMaxLifetime <= 0 {
+			customMaxLifetime = customIdleTimeout * 6
+			if customMaxLifetime < sm.maxLifetime {
+				customMaxLifetime = MinMaxLifetime
+			}
+		}
+		if err := ValidateSessionConfig(customIdleTimeout, customMaxLifetime, sm.maxSessions); err != nil {
+			return nil, err
+		}
+		idleTimeout = customIdleTimeout
+		maxLifetime = customMaxLifetime
+		isCustom = true
+	}
+
 	sessionID := generateSessionID()
 	now := time.Now()
 	session := &MemorySession{
-		ID:             sessionID,
-		CreatedAt:      now,
-		LastAccessedAt: now,
-		ExpiresAt:      now.Add(sm.maxLifetime),
-		IdleExpiresAt:  now.Add(sm.idleTimeout),
-		QueryCount:     0,
-		db:             sm.db,
+		ID:              sessionID,
+		CreatedAt:       now,
+		LastAccessedAt:  now,
+		ExpiresAt:       now.Add(maxLifetime),
+		IdleExpiresAt:   now.Add(idleTimeout),
+		QueryCount:      0,
+		IdleTimeout:     idleTimeout,
+		MaxLifetime:     maxLifetime,
+		IsCustomTimeout: isCustom,
+		db:              sm.db,
 	}
 
 	elem := sm.lruList.PushFront(sessionID)
@@ -195,6 +299,11 @@ func (sm *MemorySessionManager) CreateSession() (*MemorySession, error) {
 
 	sm.stats.TotalCreated++
 	sm.stats.TotalSessions = len(sm.sessions)
+
+	if isCustom {
+		log.Printf("[SessionManager] Session created with custom timeouts: id=%s idle=%v max_lifetime=%v",
+			sessionID, idleTimeout, maxLifetime)
+	}
 
 	return session, nil
 }
@@ -265,7 +374,7 @@ func (sm *MemorySessionManager) GetSession(sessionID string) (*MemorySession, er
 	}
 
 	session.LastAccessedAt = now
-	session.IdleExpiresAt = now.Add(sm.idleTimeout)
+	session.IdleExpiresAt = now.Add(session.IdleTimeout)
 
 	if entry, ok := sm.sessionIndex[sessionID]; ok {
 		sm.lruList.MoveToFront(entry.element)
