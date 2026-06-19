@@ -1,11 +1,13 @@
 package database
 
 import (
+	"container/list"
 	"context"
 	"crypto/rand"
 	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,24 +73,94 @@ func (m *MemoryDB) initSampleData() {
 }
 
 type MemorySession struct {
-	ID        string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	db        *MemoryDB
+	ID             string
+	CreatedAt      time.Time
+	LastAccessedAt time.Time
+	ExpiresAt      time.Time
+	IdleExpiresAt  time.Time
+	QueryCount     int64
+	db             *MemoryDB
+}
+
+type SessionStats struct {
+	TotalSessions       int       `json:"total_sessions"`
+	MaxSessions         int       `json:"max_sessions"`
+	IdleTimeout         string    `json:"idle_timeout"`
+	MaxLifetime         string    `json:"max_lifetime"`
+	TotalCreated        int64     `json:"total_created"`
+	TotalClosed         int64     `json:"total_closed"`
+	TotalExpired        int64     `json:"total_expired"`
+	TotalEvicted        int64     `json:"total_evicted"`
+	TotalQueries        int64     `json:"total_queries"`
+	LastCleanup         time.Time `json:"last_cleanup"`
+	CleanupCount        int64     `json:"cleanup_count"`
+	Uptime              string    `json:"uptime"`
+	StartTime           time.Time `json:"start_time"`
+}
+
+type lruEntry struct {
+	sessionID string
+	element   *list.Element
 }
 
 type MemorySessionManager struct {
-	sessions map[string]*MemorySession
-	mu       sync.RWMutex
-	db       *MemoryDB
-	timeout  time.Duration
+	sessions     map[string]*MemorySession
+	sessionIndex map[string]*lruEntry
+	lruList      *list.List
+	mu           sync.Mutex
+	db           *MemoryDB
+
+	idleTimeout   time.Duration
+	maxLifetime   time.Duration
+	maxSessions   int
+
+	stats         SessionStats
+	startTime     time.Time
 }
 
-func NewMemorySessionManager(timeout time.Duration) *MemorySessionManager {
+const (
+	DefaultIdleTimeout = 5 * time.Minute
+	DefaultMaxLifetime = 30 * time.Minute
+	DefaultMaxSessions = 100
+)
+
+func NewMemorySessionManager(idleTimeout time.Duration) *MemorySessionManager {
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultIdleTimeout
+	}
+
+	maxLifetime := idleTimeout * 6
+	if maxLifetime < 10*time.Minute {
+		maxLifetime = 10 * time.Minute
+	}
+	if maxLifetime > 2*time.Hour {
+		maxLifetime = 2 * time.Hour
+	}
+
 	return &MemorySessionManager{
-		sessions: make(map[string]*MemorySession),
-		db:       NewMemoryDB(),
-		timeout:  timeout,
+		sessions:     make(map[string]*MemorySession),
+		sessionIndex: make(map[string]*lruEntry),
+		lruList:      list.New(),
+		db:           NewMemoryDB(),
+		idleTimeout:  idleTimeout,
+		maxLifetime:  maxLifetime,
+		maxSessions:  DefaultMaxSessions,
+		startTime:    time.Now(),
+		stats: SessionStats{
+			MaxSessions: DefaultMaxSessions,
+			IdleTimeout: idleTimeout.String(),
+			MaxLifetime: maxLifetime.String(),
+			StartTime:   time.Now(),
+		},
+	}
+}
+
+func (sm *MemorySessionManager) SetMaxSessions(max int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if max > 0 {
+		sm.maxSessions = max
+		sm.stats.MaxSessions = max
 	}
 }
 
@@ -96,17 +168,65 @@ func (sm *MemorySessionManager) CreateSession() (*MemorySession, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	if len(sm.sessions) >= sm.maxSessions {
+		if !sm.evictOldestSessionLocked() {
+			return nil, fmt.Errorf("maximum session limit (%d) reached", sm.maxSessions)
+		}
+	}
+
 	sessionID := generateSessionID()
 	now := time.Now()
 	session := &MemorySession{
-		ID:        sessionID,
-		CreatedAt: now,
-		ExpiresAt: now.Add(sm.timeout),
-		db:        sm.db,
+		ID:             sessionID,
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		ExpiresAt:      now.Add(sm.maxLifetime),
+		IdleExpiresAt:  now.Add(sm.idleTimeout),
+		QueryCount:     0,
+		db:             sm.db,
 	}
 
+	elem := sm.lruList.PushFront(sessionID)
 	sm.sessions[sessionID] = session
+	sm.sessionIndex[sessionID] = &lruEntry{
+		sessionID: sessionID,
+		element:   elem,
+	}
+
+	sm.stats.TotalCreated++
+	sm.stats.TotalSessions = len(sm.sessions)
+
 	return session, nil
+}
+
+func (sm *MemorySessionManager) evictOldestSessionLocked() bool {
+	if sm.lruList.Len() == 0 {
+		return false
+	}
+
+	backElem := sm.lruList.Back()
+	if backElem == nil {
+		return false
+	}
+
+	sessionID := backElem.Value.(string)
+	session, exists := sm.sessions[sessionID]
+	if !exists {
+		sm.lruList.Remove(backElem)
+		delete(sm.sessionIndex, sessionID)
+		return false
+	}
+
+	log.Printf("[SessionManager] Evicting LRU session: %s (idle for %v, queries: %d)",
+		sessionID, time.Since(session.LastAccessedAt), session.QueryCount)
+
+	sm.lruList.Remove(backElem)
+	delete(sm.sessions, sessionID)
+	delete(sm.sessionIndex, sessionID)
+	sm.stats.TotalEvicted++
+	sm.stats.TotalSessions = len(sm.sessions)
+
+	return true
 }
 
 func generateSessionID() string {
@@ -118,25 +238,49 @@ func generateSessionID() string {
 }
 
 func (sm *MemorySessionManager) GetSession(sessionID string) (*MemorySession, error) {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	session, exists := sm.sessions[sessionID]
 	if !exists {
 		return nil, fmt.Errorf("session not found")
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		sm.mu.RUnlock()
-		sm.mu.Lock()
-		delete(sm.sessions, sessionID)
-		sm.mu.Unlock()
-		sm.mu.RLock()
-		return nil, fmt.Errorf("session expired")
+	now := time.Now()
+
+	if now.After(session.ExpiresAt) {
+		log.Printf("[SessionManager] Session expired (max lifetime): %s (lifetime: %v)",
+			sessionID, now.Sub(session.CreatedAt))
+		sm.removeSessionLocked(sessionID)
+		sm.stats.TotalExpired++
+		return nil, fmt.Errorf("session expired (maximum lifetime reached)")
 	}
 
-	session.ExpiresAt = time.Now().Add(sm.timeout)
+	if now.After(session.IdleExpiresAt) {
+		log.Printf("[SessionManager] Session expired (idle timeout): %s (idle: %v)",
+			sessionID, now.Sub(session.LastAccessedAt))
+		sm.removeSessionLocked(sessionID)
+		sm.stats.TotalExpired++
+		return nil, fmt.Errorf("session expired (idle timeout)")
+	}
+
+	session.LastAccessedAt = now
+	session.IdleExpiresAt = now.Add(sm.idleTimeout)
+
+	if entry, ok := sm.sessionIndex[sessionID]; ok {
+		sm.lruList.MoveToFront(entry.element)
+	}
+
 	return session, nil
+}
+
+func (sm *MemorySessionManager) removeSessionLocked(sessionID string) {
+	if entry, ok := sm.sessionIndex[sessionID]; ok {
+		sm.lruList.Remove(entry.element)
+		delete(sm.sessionIndex, sessionID)
+	}
+	delete(sm.sessions, sessionID)
+	sm.stats.TotalSessions = len(sm.sessions)
 }
 
 func (sm *MemorySessionManager) CloseSession(sessionID string) error {
@@ -148,26 +292,60 @@ func (sm *MemorySessionManager) CloseSession(sessionID string) error {
 		return fmt.Errorf("session not found")
 	}
 
-	delete(sm.sessions, sessionID)
+	sm.removeSessionLocked(sessionID)
+	sm.stats.TotalClosed++
 	return nil
 }
 
-func (sm *MemorySessionManager) CleanupExpiredSessions() {
+func (sm *MemorySessionManager) CleanupExpiredSessions() int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	now := time.Now()
-	for id, session := range sm.sessions {
-		if now.After(session.ExpiresAt) {
-			delete(sm.sessions, id)
+	cleanedCount := 0
+
+	for sessionID, session := range sm.sessions {
+		if now.After(session.ExpiresAt) || now.After(session.IdleExpiresAt) {
+			reason := "idle"
+			if now.After(session.ExpiresAt) {
+				reason = "max lifetime"
+			}
+			log.Printf("[SessionManager] Cleanup removing session: %s (reason: %s, idle: %v)",
+				sessionID, reason, now.Sub(session.LastAccessedAt))
+			sm.removeSessionLocked(sessionID)
+			sm.stats.TotalExpired++
+			cleanedCount++
 		}
 	}
+
+	sm.stats.LastCleanup = now
+	sm.stats.CleanupCount++
+	sm.stats.Uptime = time.Since(sm.startTime).String()
+
+	if cleanedCount > 0 {
+		log.Printf("[SessionManager] Cleanup complete: removed %d expired sessions, remaining: %d",
+			cleanedCount, len(sm.sessions))
+	}
+
+	return cleanedCount
+}
+
+func (sm *MemorySessionManager) GetStats() SessionStats {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.stats.TotalSessions = len(sm.sessions)
+	sm.stats.Uptime = time.Since(sm.startTime).String()
+	return sm.stats
 }
 
 func (sm *MemorySessionManager) StartCleanupWorker(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(10 * time.Second)
 	go func() {
 		defer ticker.Stop()
+		log.Printf("[SessionManager] Cleanup worker started (interval: 10s, idle timeout: %v, max lifetime: %v, max sessions: %d)",
+			sm.idleTimeout, sm.maxLifetime, sm.maxSessions)
+
 		for {
 			select {
 			case <-ticker.C:
@@ -175,14 +353,24 @@ func (sm *MemorySessionManager) StartCleanupWorker(ctx context.Context) {
 			case <-ctx.Done():
 				sm.mu.Lock()
 				defer sm.mu.Unlock()
-				sm.sessions = make(map[string]*MemorySession)
+				log.Printf("[SessionManager] Cleanup worker shutting down, closing %d remaining sessions", len(sm.sessions))
+				for id := range sm.sessions {
+					sm.removeSessionLocked(id)
+				}
+				sm.stats.TotalSessions = 0
 				return
 			}
 		}
 	}()
 }
 
+func (s *MemorySession) RecordQuery() {
+	s.QueryCount++
+}
+
 func (s *MemorySession) ExecuteQuery(ctx context.Context, query string) ([]map[string]interface{}, error) {
+	s.RecordQuery()
+
 	s.db.mu.RLock()
 	defer s.db.mu.RUnlock()
 
@@ -254,9 +442,30 @@ func parseSelectQuery(query string) (string, []string, *WhereCondition, error) {
 	if whereIdx != -1 {
 		tableName = strings.TrimSpace(afterFrom[:whereIdx])
 		wherePart := strings.TrimSpace(afterFrom[whereIdx+7:])
+
+		limitIdx := strings.Index(strings.ToUpper(wherePart), " LIMIT ")
+		if limitIdx != -1 {
+			wherePart = strings.TrimSpace(wherePart[:limitIdx])
+		}
+
+		orderByIdx := strings.Index(strings.ToUpper(wherePart), " ORDER BY ")
+		if orderByIdx != -1 {
+			wherePart = strings.TrimSpace(wherePart[:orderByIdx])
+		}
+
 		whereClause = parseWhereClause(wherePart)
 	} else {
-		tableName = strings.TrimSpace(afterFrom)
+		limitIdx := strings.Index(strings.ToUpper(afterFrom), " LIMIT ")
+		if limitIdx != -1 {
+			tableName = strings.TrimSpace(afterFrom[:limitIdx])
+		} else {
+			orderByIdx := strings.Index(strings.ToUpper(afterFrom), " ORDER BY ")
+			if orderByIdx != -1 {
+				tableName = strings.TrimSpace(afterFrom[:orderByIdx])
+			} else {
+				tableName = strings.TrimSpace(afterFrom)
+			}
+		}
 	}
 
 	return tableName, columns, whereClause, nil

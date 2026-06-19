@@ -16,11 +16,13 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP server address")
-	timeout := flag.Duration("timeout", 30*time.Minute, "Session timeout duration")
+	idleTimeout := flag.Duration("idle-timeout", 5*time.Minute, "Session idle timeout (session expires after this duration of inactivity)")
+	maxSessions := flag.Int("max-sessions", 100, "Maximum number of concurrent sessions (oldest LRU sessions will be evicted when limit is reached)")
 	flag.Parse()
 
 	log.Println("Using in-memory database mode")
-	sessionManager := database.NewMemorySessionManager(*timeout)
+	sessionManager := database.NewMemorySessionManager(*idleTimeout)
+	sessionManager.SetMaxSessions(*maxSessions)
 	h := handler.NewMemoryHandler(sessionManager)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -30,9 +32,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.HealthCheck)
+	mux.HandleFunc("/stats", h.GetStats)
 	mux.HandleFunc("/session/create", h.CreateSession)
-	mux.HandleFunc("/query", h.ExecuteQuery)
+	mux.HandleFunc("/session/info", h.GetSessionInfo)
 	mux.HandleFunc("/session/close", h.CloseSession)
+	mux.HandleFunc("/query", h.ExecuteQuery)
 
 	server := &http.Server{
 		Addr:              *addr,
@@ -47,21 +51,31 @@ func main() {
 
 	go func() {
 		log.Printf("Starting read-only database API server on %s", *addr)
-		log.Printf("Session timeout: %v", *timeout)
+		log.Printf("Session idle timeout: %v", *idleTimeout)
+		log.Printf("Maximum concurrent sessions: %d", *maxSessions)
 		log.Println()
 		log.Println("Available endpoints:")
-		log.Println("  GET  /health          - Health check")
+		log.Println("  GET  /health          - Health check (includes active sessions count)")
+		log.Println("  GET  /stats           - Session manager statistics")
 		log.Println("  POST /session/create  - Create a new read-only session")
-		log.Println("  POST /query           - Execute a SELECT query (requires X-Session-Id header)")
+		log.Println("  GET  /session/info    - Get current session info (requires X-Session-Id header)")
 		log.Println("  POST /session/close   - Close an existing session")
+		log.Println("  POST /query           - Execute a SELECT query (requires X-Session-Id header)")
+		log.Println()
+		log.Println("Session management features:")
+		log.Println("  - Idle timeout: sessions automatically expire after idle period")
+		log.Println("  - Max lifetime: sessions have a maximum absolute lifetime")
+		log.Println("  - LRU eviction: oldest sessions evicted when max limit reached")
+		log.Println("  - Background cleanup: expired sessions cleaned every 10 seconds")
 		log.Println()
 		log.Println("Available tables: users, products, orders")
 		log.Println()
 		log.Println("Sample queries:")
 		log.Println("  SELECT * FROM users")
 		log.Println("  SELECT id, username, email FROM users WHERE age > 30")
-		log.Println("  SELECT category, COUNT(*) as count FROM products GROUP BY category")
-		log.Println("  SELECT * FROM orders WHERE status = 'delivered' LIMIT 10")
+		log.Println("  SELECT * FROM users WHERE age > 25 AND is_active = 1")
+		log.Println("  SELECT name, category, price FROM products WHERE price > 100 LIMIT 5")
+		log.Println("  SELECT * FROM orders WHERE status = 'delivered'")
 		log.Println()
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)

@@ -19,6 +19,8 @@ type MemorySessionManager interface {
 	GetSession(sessionID string) (*database.MemorySession, error)
 	CloseSession(sessionID string) error
 	StartCleanupWorker(ctx context.Context)
+	GetStats() database.SessionStats
+	SetMaxSessions(max int)
 }
 
 type Handler struct {
@@ -32,10 +34,14 @@ func NewMemoryHandler(sm *database.MemorySessionManager) *Handler {
 }
 
 type CreateSessionResponse struct {
-	SessionID string    `json:"session_id"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Message   string    `json:"message"`
+	SessionID        string    `json:"session_id"`
+	CreatedAt        time.Time `json:"created_at"`
+	LastAccessedAt   time.Time `json:"last_accessed_at"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	IdleExpiresAt    time.Time `json:"idle_expires_at"`
+	IdleTimeout      string    `json:"idle_timeout"`
+	MaxLifetime      string    `json:"max_lifetime"`
+	Message          string    `json:"message"`
 }
 
 type QueryRequest struct {
@@ -43,10 +49,11 @@ type QueryRequest struct {
 }
 
 type QueryResponse struct {
-	Columns []string               `json:"columns"`
-	Rows    []map[string]interface{} `json:"rows"`
-	Count   int                    `json:"count"`
-	Time    float64                `json:"execution_time_ms"`
+	Columns      []string                 `json:"columns"`
+	Rows         []map[string]interface{} `json:"rows"`
+	Count        int                      `json:"count"`
+	Time         float64                  `json:"execution_time_ms"`
+	QueryCount   int64                    `json:"session_query_count"`
 }
 
 type ErrorResponse struct {
@@ -67,11 +74,16 @@ func (h *Handler) CreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stats := h.sessionManager.GetStats()
 	response := CreateSessionResponse{
-		SessionID: session.ID,
-		CreatedAt: session.CreatedAt,
-		ExpiresAt: session.ExpiresAt,
-		Message:   "Read-only session created successfully. Use session_id in X-Session-Id header for queries.",
+		SessionID:      session.ID,
+		CreatedAt:      session.CreatedAt,
+		LastAccessedAt: session.LastAccessedAt,
+		ExpiresAt:      session.ExpiresAt,
+		IdleExpiresAt:  session.IdleExpiresAt,
+		IdleTimeout:    stats.IdleTimeout,
+		MaxLifetime:    stats.MaxLifetime,
+		Message:        "Read-only session created successfully. Use session_id in X-Session-Id header for queries.",
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -131,10 +143,11 @@ func (h *Handler) ExecuteQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := QueryResponse{
-		Columns: columns,
-		Rows:    results,
-		Count:   len(results),
-		Time:    executionTime,
+		Columns:     columns,
+		Rows:        results,
+		Count:       len(results),
+		Time:        executionTime,
+		QueryCount:  executor.QueryCount,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -170,11 +183,63 @@ func (h *Handler) CloseSession(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+
+	stats := h.sessionManager.GetStats()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "healthy",
-		"timestamp": time.Now().Format(time.RFC3339),
-		"service":   "readonly-db-api",
-		"mode":      "memory",
+		"status":          "healthy",
+		"timestamp":       time.Now().Format(time.RFC3339),
+		"service":         "readonly-db-api",
+		"mode":            "memory",
+		"active_sessions": stats.TotalSessions,
+		"uptime":          stats.Uptime,
+	})
+}
+
+func (h *Handler) GetStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendError(w, http.StatusMethodNotAllowed, "method not allowed", "only GET method is accepted")
+		return
+	}
+
+	stats := h.sessionManager.GetStats()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_manager": stats,
+	})
+}
+
+func (h *Handler) GetSessionInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		sendError(w, http.StatusMethodNotAllowed, "method not allowed", "only GET method is accepted")
+		return
+	}
+
+	sessionID := r.Header.Get("X-Session-Id")
+	if sessionID == "" {
+		sendError(w, http.StatusBadRequest, "missing session id", "X-Session-Id header is required")
+		return
+	}
+
+	session, err := h.sessionManager.GetSession(sessionID)
+	if err != nil {
+		sendError(w, http.StatusUnauthorized, "invalid session", err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"session_id":        session.ID,
+		"created_at":        session.CreatedAt,
+		"last_accessed_at":  session.LastAccessedAt,
+		"expires_at":        session.ExpiresAt,
+		"idle_expires_at":   session.IdleExpiresAt,
+		"query_count":       session.QueryCount,
+		"idle_time_seconds": time.Since(session.LastAccessedAt).Seconds(),
+		"remaining_idle_seconds": time.Until(session.IdleExpiresAt).Seconds(),
+		"remaining_lifetime_seconds": time.Until(session.ExpiresAt).Seconds(),
 	})
 }
 
